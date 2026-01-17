@@ -36,6 +36,10 @@ var (
 		".git": true, "node_modules": true, "vendor": true,
 		".next": true, ".idea": true, ".vscode": true, "bin": true,
 	}
+
+	// AllowedPathPrefixes stores absolute paths that are safe to read from.
+	// This includes the project root, GOMODCACHE, and GOROOT.
+	AllowedPathPrefixes []string
 )
 
 // FileScore represents the relevance of a file to a search query.
@@ -67,32 +71,32 @@ func main() {
 	flag.Parse()
 	args := flag.Args()
 
+	// Resolve absolute path for the project root
+	absPath, err := filepath.Abs(*searchPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving path: %v\n", err)
+		os.Exit(1)
+	}
+
 	// If using gopls, initialize it immediately.
 	// It runs as a background process.
 	if *useGopls {
-		absPath, _ := filepath.Abs(*searchPath)
 		InitGopls(absPath)
 		defer ShutdownGopls()
 	}
 
 	// No query arguments -> Run as MCP Server (stdio mode)
 	if len(args) == 0 {
-		runServer(*searchPath)
+		runServer(absPath)
 		return
 	}
 
 	// Query arguments present -> Run as CLI tool
 	query := strings.Join(args, " ")
-	runCLI(query, *searchPath, *jsonOutput)
+	runCLI(query, absPath, *jsonOutput)
 }
 
-func runCLI(query string, rootPath string, asJson bool) {
-	absPath, err := filepath.Abs(rootPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-
+func runCLI(query string, absPath string, asJson bool) {
 	start := time.Now()
 	// Run Hybrid Search (Local AST + Gopls)
 	results, err := Search(absPath, query)
@@ -139,7 +143,53 @@ func runCLI(query string, rootPath string, asJson bool) {
 	}
 }
 
+// initSecurity configures the allowed paths for read_file.
+// It allows the project root, the Go Module Cache, and GOROOT.
+func initSecurity(rootPath string) {
+	AllowedPathPrefixes = append(AllowedPathPrefixes, rootPath)
+
+	// Add GOMODCACHE
+	if out, err := exec.Command("go", "env", "GOMODCACHE").Output(); err == nil {
+		path := strings.TrimSpace(string(out))
+		if path != "" {
+			AllowedPathPrefixes = append(AllowedPathPrefixes, path)
+		}
+	}
+
+	// Add GOROOT
+	if out, err := exec.Command("go", "env", "GOROOT").Output(); err == nil {
+		path := strings.TrimSpace(string(out))
+		if path != "" {
+			AllowedPathPrefixes = append(AllowedPathPrefixes, path)
+		}
+	}
+}
+
+// isAllowedPath checks if the target path is within one of the allowed prefixes.
+func isAllowedPath(target string) bool {
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+
+	// Clean the path to remove .. and double separators
+	cleanTarget := filepath.Clean(absTarget)
+
+	for _, prefix := range AllowedPathPrefixes {
+		// Ensure prefix allows for checking subdirectories correctly
+		// e.g. /app matches /app/foo but not /apple
+		cleanPrefix := filepath.Clean(prefix)
+		if cleanTarget == cleanPrefix || strings.HasPrefix(cleanTarget, cleanPrefix+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
 func runServer(rootPath string) {
+	// Initialize security boundaries
+	initSecurity(rootPath)
+
 	s := server.NewMCPServer(
 		"Search-MCP",
 		"1.2.0",
@@ -154,40 +204,55 @@ func runServer(rootPath string) {
 
 	s.AddTool(searchTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query, _ := request.RequireString("query")
-		absPath, _ := filepath.Abs(rootPath)
+		start := time.Now()
 
-		results, err := Search(absPath, query)
+		results, err := Search(rootPath, query)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("Error: %v", err)), nil
 		}
 
-		// Format results for the LLM context
-		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("Found %d results:\n\n", len(results)))
-
-		for _, r := range results {
-			prefix := ""
-			if r.IsDep {
-				prefix = "[DEPENDENCY] "
-			}
-			reasons := strings.Join(r.Reasons, ", ")
-			sb.WriteString(fmt.Sprintf("- %s%s (Score: %d) [%s]\n", prefix, r.Path, r.Score, reasons))
+		// Create JSON output structure
+		output := CLIOutput{
+			Query:    query,
+			Duration: time.Since(start).String(),
+			Count:    len(results),
+			Files:    results,
 		}
-		return mcp.NewToolResultText(sb.String()), nil
+
+		jsonData, err := json.MarshalIndent(output, "", "  ")
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("JSON marshaling failed: %v", err)), nil
+		}
+
+		return mcp.NewToolResultText(string(jsonData)), nil
 	})
 
 	// Tool: read_file
-	s.AddTool(mcp.NewTool("read_file", mcp.WithString("path", mcp.Required())),
-		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			pathArg, _ := request.RequireString("path")
-			// Note: We allow absolute paths here because gopls returns absolute paths for dependencies.
-			// In a high-security environment, path validation logic should be added here.
-			content, err := os.ReadFile(pathArg)
-			if err != nil {
-				return mcp.NewToolResultError(err.Error()), nil
-			}
-			return mcp.NewToolResultText(string(content)), nil
-		})
+	readTool := mcp.NewTool("read_file",
+		mcp.WithDescription("Read the full content of a file. This tool is restricted to files within the project root, the Go Module Cache, or the Go Standard Library. Use this to read files found via search_files."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Absolute path to the file (or relative to project root)")),
+	)
+
+	s.AddTool(readTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		pathArg, _ := request.RequireString("path")
+
+		// Handle relative paths by joining with root, but respect absolute paths (common from gopls)
+		targetPath := pathArg
+		if !filepath.IsAbs(pathArg) {
+			targetPath = filepath.Join(rootPath, pathArg)
+		}
+
+		// Security Check
+		if !isAllowedPath(targetPath) {
+			return mcp.NewToolResultError(fmt.Sprintf("Access Denied: Reading file %s is not allowed. Scope restricted to project root and Go dependencies.", pathArg)), nil
+		}
+
+		content, err := os.ReadFile(targetPath)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(string(content)), nil
+	})
 
 	if err := server.ServeStdio(s); err != nil {
 		os.Exit(1)
@@ -196,13 +261,10 @@ func runServer(rootPath string) {
 
 // Search runs local AST search and Gopls dependency search concurrently
 // and merges the results with deduplication.
-func Search(root string, query string) ([]FileScore, error) {
+func Search(absRoot string, query string) ([]FileScore, error) {
 	var results []FileScore
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-
-	// Normalize root for consistent matching
-	absRoot, _ := filepath.Abs(root)
 
 	queryLower := strings.ToLower(strings.TrimSpace(query))
 	terms := Tokenize(query)
