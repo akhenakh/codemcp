@@ -78,11 +78,15 @@ It is much smarter than grep because it understands Go structure and can search 
 
 ## Tools Provided
 
-The server exposes one primary tool:
+The server exposes the following tools:
 
 *   **`search_files`**:
-    *   **Arguments**: `query` (string), `path` (optional string).
+    *   **Arguments**: `query` (string).
     *   **Description**: "Search codebase and dependencies. Uses AST for local files and Gopls for dependencies/symbols. Always use this before read_file."
+
+*   **`read_file`**:
+    *   **Arguments**: `path` (string).
+    *   **Description**: "Read the full content of a file. This tool is restricted to files within the project root, the Go Module Cache, or the Go Standard Library. Use this to read files found via search_files."
 
 ## How it Works
 
